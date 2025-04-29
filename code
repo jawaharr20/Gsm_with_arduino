@@ -1,0 +1,303 @@
+#include <SoftwareSerial.h>
+
+SoftwareSerial sim800(3, 2);  // SIM800L TX to pin 3, RX to pin 2
+
+String incomingData = "";      // Store incoming serial data
+String allowedNumber = "+91xxxxxxxxxx";  // Allowed number
+bool callAnswered = false;     // Track call state
+const int relayPin = 4;       // Relay pin
+const int voltagePin = A0;    // Voltage sensor pin
+bool relayState = false;      // Relay is OFF
+unsigned long lastCommandTime = 0;  // Prevent command overlap
+
+void setup() {
+  Serial.begin(9600);         // Serial monitor
+  pinMode(relayPin, OUTPUT);  // Relay pin
+  pinMode(voltagePin, INPUT); // Voltage sensor pin
+  digitalWrite(relayPin, HIGH); // Relay OFF (active-low)
+
+  Serial.println("Initializing...");
+  delay(10000);  // Extended delay for SIM800L stability
+
+  // Start SIM800L
+  sim800.begin(9600);
+  Serial.println("Starting at 9600 baud...");
+
+  // Clear serial buffer
+  while (sim800.available()) sim800.read();
+  delay(1000);
+
+  // Initialize with retries
+  bool initialized = false;
+  for (int retry = 0; retry < 5 && !initialized; retry++) {
+    Serial.println("Initialization attempt " + String(retry + 1));
+
+    // Set baud rate
+    if (sendCommand("AT+IPR=9600", 5000, "OK")) {
+      Serial.println("Baud rate set to 9600");
+      delay(2000);
+
+      // Test basic communication
+      if (sendCommand("AT", 5000, "OK")) {
+        Serial.println("SIM800L responding");
+        delay(2000);
+
+        // Enable caller ID with retries
+        bool clipSet = false;
+        for (int clipRetry = 0; clipRetry < 3 && !clipSet; clipRetry++) {
+          if (sendCommand("AT+CLIP=1", 5000, "OK")) {
+            Serial.println("Caller ID enabled");
+            clipSet = true;
+          } else {
+            Serial.println("CLIP Retry " + String(clipRetry + 1) + ": AT+CLIP=1 failed");
+            delay(2000);
+          }
+        }
+        if (clipSet) {
+          // Set SMS text mode with retries
+          bool cmgfSet = false;
+          for (int cmgfRetry = 0; cmgfRetry < 3 && !cmgfSet; cmgfRetry++) {
+            if (sendCommand("AT+CMGF=1", 5000, "OK")) {
+              Serial.println("SMS text mode set");
+              cmgfSet = true;
+            } else {
+              Serial.println("CMGF Retry " + String(cmgfRetry + 1) + ": AT+CMGF=1 failed");
+              delay(2000);
+            }
+          }
+          if (cmgfSet) {
+            initialized = true;
+          }
+        }
+      } else {
+        Serial.println("AT command failed");
+      }
+    } else {
+      Serial.println("AT+IPR=9600 failed");
+    }
+    if (!initialized) {
+      Serial.println("Retrying after delay...");
+      delay(5000);
+    }
+  }
+
+  if (!initialized) {
+    Serial.println("Initialization failed after 5 retries. Check SIM800L, wiring, or power.");
+    while (1); // Remove for non-critical use
+  }
+
+  Serial.println("Ready to detect calls...");
+}
+
+void loop() {
+  if (sim800.available()) {
+    char c = sim800.read();
+    if (c >= 32 && c <= 126 || c == '\n' || c == '\r') {
+      Serial.write(c);
+      incomingData += c;
+    } else {
+      Serial.print("[Non-printable: 0x");
+      Serial.print(c, HEX);
+      Serial.print("]");
+    }
+
+    if (c == '\n') {
+      incomingData.trim();
+
+      if (incomingData.indexOf("RING") >= 0) {
+        Serial.println("Incoming call detected!");
+        callAnswered = false;
+        incomingData = "";
+      }
+
+      if (incomingData.indexOf("+CLIP:") >= 0) {
+        Serial.println("Raw CLIP: " + incomingData);
+        int startIndex = incomingData.indexOf("\"") + 1;
+        int endIndex = incomingData.indexOf("\"", startIndex);
+        if (endIndex < startIndex) {
+          endIndex = incomingData.indexOf(",", startIndex);
+          if (endIndex < startIndex) endIndex = incomingData.length();
+        }
+        String callerNumber = incomingData.substring(startIndex, endIndex);
+        Serial.println("Parsed Caller: " + callerNumber);
+
+        if (callerNumber == allowedNumber || callerNumber.indexOf("9025676907") >= 0) {
+          if (!callAnswered && millis() - lastCommandTime > 5000) {
+            if (sendCommand("ATA", 5000, "OK")) {
+              Serial.println("Call answered successfully.");
+            } else {
+              Serial.println("Failed to answer call.");
+            }
+            lastCommandTime = millis();
+          }
+
+          // Toggle relay
+          relayState = !relayState;
+          digitalWrite(relayPin, relayState ? LOW : HIGH);
+          Serial.println("Relay turned " + String(relayState ? "ON" : "OFF"));
+
+          // Send relay state SMS
+          String relayMessage = "Relay is " + String(relayState ? "ON" : "OFF");
+          if (sendSMS(allowedNumber, relayMessage)) {
+            Serial.println("Relay SMS sent successfully.");
+          } else {
+            Serial.println("Relay SMS failed.");
+          }
+
+          // Read voltage and send voltage SMS
+          float voltage = readVoltage();
+          Serial.println("Measured Voltage: " + String(voltage, 2) + "V");
+          String voltageMessage = "Voltage: " + String(voltage, 2) + "V";
+          if (sendSMS(allowedNumber, voltageMessage)) {
+            Serial.println("Voltage SMS sent successfully.");
+          } else {
+            Serial.println("Voltage SMS failed.");
+          }
+        } else {
+          Serial.println("Blocked number: " + callerNumber);
+        }
+
+        incomingData = "";
+      }
+
+      incomingData = "";
+    }
+  }
+}
+
+float readVoltage() {
+  int sensorValue = analogRead(voltagePin); // Read analog value (0-1023)
+  Serial.println("Raw Analog Value: " + String(sensorValue)); // Debug raw value
+  // Convert to voltage (assuming 0-25V sensor, 5V Arduino reference)
+  float voltage = sensorValue * (25.0 / 1023.0);
+  // Validate voltage
+  if (sensorValue <= 0 || voltage > 25.0) {
+    Serial.println("Warning: Invalid voltage reading - " + String(voltage, 2) + "V. Check sensor wiring.");
+    return 0.0; // Return 0.0 if reading is invalid
+  }
+  return voltage;
+}
+
+bool sendSMS(String number, String message) {
+  Serial.println("Sending SMS to: " + number + ", Message: " + message);
+
+  // Clear buffer before starting
+  while (sim800.available()) sim800.read();
+
+  // Check network registration
+  String netResponse = getCommandResponse("AT+CREG?", 5000);
+  Serial.println("Network Status: " + netResponse);
+  if (netResponse.indexOf("+CREG: 0,1") < 0 && netResponse.indexOf("+CREG: 0,5") < 0) {
+    Serial.println("SMS failed: Not registered on network.");
+    return false;
+  }
+
+  // Check signal strength (fixed AT+CSQ command)
+  String signalResponse = getCommandResponse("AT+CSQ", 5000);
+  Serial.println("Signal Strength: " + signalResponse);
+  if (signalResponse.indexOf("+CSQ: 0,0") >= 0) {
+    Serial.println("SMS failed: No signal.");
+    return false;
+  }
+
+  // Set SMS text mode with retries
+  bool cmgfSet = false;
+  for (int cmgfRetry = 0; cmgfRetry < 3 && !cmgfSet; cmgfRetry++) {
+    while (sim800.available()) sim800.read(); // Clear buffer
+    if (sendCommand("AT+CMGF=1", 5000, "OK")) {
+      Serial.println("SMS text mode set");
+      cmgfSet = true;
+    } else {
+      Serial.println("CMGF Retry " + String(cmgfRetry + 1) + ": AT+CMGF=1 failed");
+      delay(2000);
+    }
+  }
+  if (!cmgfSet) {
+    Serial.println("SMS failed: Could not set CMGF.");
+    return false;
+  }
+
+  // Send SMS with retries
+  bool smsSent = false;
+  for (int smsRetry = 0; smsRetry < 3 && !smsSent; smsRetry++) {
+    Serial.println("SMS attempt " + String(smsRetry + 1));
+    // Clear buffer
+    while (sim800.available()) sim800.read();
+    // Send AT+CMGS command
+    sim800.print("AT+CMGS=\"" + number + "\"\r");
+    delay(1000); // Increased delay for SIM800L to process
+    // Wait for prompt
+    String promptResponse = getCommandResponse("", 2000);
+    Serial.println("CMGS Prompt Response: " + promptResponse);
+    if (promptResponse.indexOf(">") >= 0) {
+      // Send message
+      sim800.print(message);
+      delay(500);
+      sim800.write(26);  // CTRL+Z
+      // Wait for response
+      String response = getCommandResponse("", 10000); // Increased timeout
+      Serial.println("CMGS Response: " + response);
+      if (response.indexOf("+CMGS:") >= 0 || response.indexOf("OK") >= 0) {
+        Serial.println("SMS Sent: " + message);
+        smsSent = true;
+      } else {
+        Serial.println("AT+CMGS failed on attempt " + String(smsRetry + 1));
+        delay(2000);
+      }
+    } else {
+      Serial.println("No prompt received for AT+CMGS on attempt " + String(smsRetry + 1));
+      delay(2000);
+    }
+  }
+
+  return smsSent;
+}
+
+bool sendCommand(String cmd, int delayTime, String expectedResponse) {
+  // Clear buffer
+  while (sim800.available()) sim800.read();
+  Serial.println("Sending: " + cmd);
+  sim800.println(cmd);
+  String response = "";
+  unsigned long startTime = millis();
+  while (millis() - startTime < delayTime) {
+    if (sim800.available()) {
+      char c = sim800.read();
+      if (c >= 32 && c <= 126 || c == '\n' || c == '\r') {
+        response += c;
+        Serial.write(c);
+      } else {
+        Serial.print("[Non-printable: 0x");
+        Serial.print(c, HEX);
+        Serial.print("]");
+      }
+    }
+  }
+  Serial.println();
+  return response.indexOf(expectedResponse) >= 0;
+}
+
+String getCommandResponse(String cmd, int delayTime) {
+  if (cmd != "") {
+    // Clear buffer
+    while (sim800.available()) sim800.read();
+    Serial.println("Sending: " + cmd);
+    sim800.println(cmd);
+  }
+  String response = "";
+  unsigned long startTime = millis();
+  while (millis() - startTime < delayTime) {
+    if (sim800.available()) {
+      char c = sim800.read();
+      if (c >= 32 && c <= 126 || c == '\n' || c == '\r') {
+        response += c;
+        Serial.write(c);
+      } else {
+        Serial.print("[Non-printable: 0x");
+        Serial.print(c, HEX);
+        Serial.print("]");
+      }
+    }
+  }
+  return response;
+}
